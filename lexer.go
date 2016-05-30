@@ -4,6 +4,8 @@ import "io"
 import "errors"
 import "unicode"
 import "bytes"
+import "container/list"
+import "fmt"
 
 var NullArgumentError = errors.New("Null argument.")
 
@@ -27,84 +29,129 @@ type Token struct {
 	Type       TokenType
 	Literal    string
 	LineNumber int
-	LinPos     int
+	LinePos    int
 }
 
-type Categorizer func(r rune) bool
-
-type Categorizers struct {
-	IsWhitespace    func(r rune) bool
-	IsIdentifier    func(r rune, pos int) bool
-	IsNumber        func(r rune, pos int) bool
-	IsQuotationMark func(lastMark rune, r rune) (mark rune, result bool)
+type ILexerScanner interface {
+	NextRune() rune
+	Rune() rune
+	AppendRune() bool
 }
 
-func NewCategorizers() *Categorizers {
-	return &Categorizers{
-		IsWhitespace:     unicode.IsSpace,
-		isIdentifierLead: isIdentifierLead,
-		IsIdentifier:     isIdentifier,
-		IsNumber:         unicode.IsDigit,
-		IsQuotationMark:  isQuotationMark,
-		IsComment:        isComment,
+type TokenParser func(scanner ILexerScanner) TokenType
+
+type TokenParsers struct {
+	WhitespaceParser TokenParser
+	Parsers          []TokenParser
+}
+
+func NewTokenParsers() *TokenParsers {
+	return &TokenParsers{
+		WhitespaceParser: DefaultWhitespaceParser,
+		Parsers: []TokenParser{
+			DefaultIdentifierParser,
+			DefaultNumberParser,
+			DefaultQuotedStringParser,
+			DefaultCommentParser,
+		},
 	}
 }
 
-func isIdentifier(r rune, pos int) bool {
-	if pos == 0 {
-		return unicode.IsLetter(r) || r == '_'
-	} else {
-		return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
-	}
-}
-
-func isNumber(r rune, pos int) bool {
-	return unicode.IsDigit(r)
-}
-
-func isQuotationMark(lastMark rune, r rune) (mark rune, result bool) {
-	if r == '"' || r == '\'' {
-		if lastMark == 0 || lastMark == r {
-			return r, true
+func DefaultWhitespaceParser(scanner ILexerScanner) TokenType {
+	if unicode.IsSpace(scanner.Rune()) {
+		for unicode.IsSpace(scanner.Rune()) {
+			if scanner.NextRune() == 0 {
+				break
+			}
 		}
 	}
-	return 0, false
+	return TOKEN_NULL
 }
 
-func isComment(r rune) bool {
-	return r == '#'
+func DefaultIdentifierParser(scanner ILexerScanner) TokenType {
+	r := scanner.Rune()
+	if unicode.IsLetter(r) || r == '_' {
+		for unicode.IsLetter(r) || r == '_' || unicode.IsDigit(r) {
+			scanner.AppendRune()
+			r = scanner.NextRune()
+		}
+		return TOKEN_IDENTIFIER
+	}
+	return TOKEN_NULL
+}
+
+func DefaultNumberParser(scanner ILexerScanner) TokenType {
+	r := scanner.Rune()
+	if unicode.IsDigit(r) {
+		for unicode.IsDigit(r) {
+			scanner.AppendRune()
+			r = scanner.NextRune()
+		}
+		return TOKEN_NUMBER
+	}
+	return TOKEN_NULL
+}
+
+func DefaultQuotedStringParser(scanner ILexerScanner) TokenType {
+	quotemark := scanner.Rune()
+	if quotemark == '"' || quotemark == '\'' {
+		for scanner.NextRune() != 0 {
+			if scanner.Rune() == quotemark {
+				break
+			}
+			scanner.AppendRune()
+		}
+		return TOKEN_STRING
+	}
+	return TOKEN_NULL
+}
+
+func DefaultCommentParser(scanner ILexerScanner) TokenType {
+	r := scanner.Rune()
+	if r == '#' {
+		for scanner.NextRune() != 0 {
+			if scanner.Rune() == '\n' {
+				break
+			}
+		}
+	}
+	return TOKEN_NULL
 }
 
 type Lexer struct {
-	categorizers Categorizers
-	scanner      io.RuneScanner
-	lineno       int
-	pos          int
-	r            rune
-	eof          bool
-	buf          bytes.Buffer
-	lastToken    Token
+	tokenParsers  *TokenParsers
+	scanner       io.RuneScanner
+	lineno        int
+	pos           int
+	r             rune
+	eof           bool
+	buf           bytes.Buffer
+	lastToken     Token
+	putbackTokens *list.List
 }
 
-func NewLexer(scanner io.RuneScanner, categorizers *Categorizers) (*Lexer, error) {
+func NewLexer(scanner io.RuneScanner, tokenParsers *TokenParsers) (*Lexer, error) {
 	if scanner == nil {
 		return nil, NullArgumentError
 	}
-	if categorizers == nil {
-		categorizers = NewCategorizers()
+	if tokenParsers == nil {
+		tokenParsers = NewTokenParsers()
 	}
 
 	lexer := new(Lexer)
-	lexer.categorizers = categorizers
+	lexer.tokenParsers = tokenParsers
 	lexer.scanner = scanner
-	lexer.buf = new(bytes.Buffer)
+	lexer.putbackTokens = list.New()
 
-	return lexer
+	lexer.NextRune()
+
+	return lexer, nil
 }
 
-func (self *Lexer) nextRune() (validRune bool) {
+func (self *Lexer) NextRune() rune {
 	if !self.eof {
 		r, size, err := self.scanner.ReadRune()
+		fmt.Printf("Next Rune: %q (%d)\n", r, size)
 		if err != nil {
 			r = 0
 			self.eof = true
@@ -116,11 +163,16 @@ func (self *Lexer) nextRune() (validRune bool) {
 		}
 		self.r = r
 	}
-	return !self.eof
+	return self.r
 }
 
-func (self *Lexer) appendRune() {
+func (self *Lexer) Rune() rune {
+	return self.r
+}
+
+func (self *Lexer) AppendRune() bool {
 	self.buf.WriteRune(self.r)
+	return true
 }
 
 func (self *Lexer) token(tokenType TokenType) Token {
@@ -133,97 +185,39 @@ func (self *Lexer) token(tokenType TokenType) Token {
 	return self.lastToken
 }
 
-func (self *Lexer) isWhitespace() bool {
-	if self.eof {
-		return false
-	}
-	if self.r == 0 {
-		return true
-	}
-	if self.categorizers.IsWhitespace != nil {
-		return self.categorizers.IsWhitespace(self.r)
-	}
-	return false
-}
-
-func (self *Lexer) isIdentifierLead() bool {
-	if self.eof {
-		return false
-	}
-	if self.categorizers.IsIdentifierLead != nil {
-		return self.categorizers.IsIdentifierLead(self.r)
-	}
-	return false
-}
-
-func (self *Lexer) isIdentifier() bool {
-	if self.eof {
-		return false
-	}
-	if self.categorizers.IsIdentifier != nil {
-		return self.categorizers.IsIdentifier(self.r)
-	}
-	return false
-}
-
-func (self *Lexer) isNumber() bool {
-	if self.eof {
-		return false
-	}
-	if self.categorizers.IsNumber != nil {
-		return self.categorizers.IsNumber(self.r)
-	}
-	return false
-}
-
-func (self *Lexer) isQuotationMark(lastMark rune) (mark rune, result bool) {
-	if self.eof {
-		return 0, false
-	}
-	if self.categorizers.IsQuotationMark != nil {
-		return self.categorizers.IsQuotationMark(lastMark, self.r)
-	}
-	return 0, false
-}
-
 func (self *Lexer) IsEnd() bool {
 	return self.eof
 }
 
 func (self *Lexer) GetToken() (Token, error) {
-	for self.isWhitespace() && self.nextRune() {
+	if self.putbackTokens.Len() > 0 {
+		e := self.putbackTokens.Back()
+		ptoken, _ := e.Value.(*Token)
+		self.lastToken = *ptoken
+		self.putbackTokens.Remove(e)
+		return self.lastToken, nil
+	}
+
+	self.tokenParsers.WhitespaceParser(self)
+	if self.eof {
+		return self.token(TOKEN_EOF), nil
 	}
 
 	self.buf.Reset()
-
-	if self.isIdentifierLead() {
-		for self.isIdentifier() {
-			self.appendRune()
-			self.nextRune()
-		}
-		return self.token(TOKEN_IDENTIFIER)
-	}
-
-	if self.isNumber() {
-		for self.isNumber() {
-			self.appendRune()
-			self.nextRune()
-		}
-		return self.token(TOKEN_NUMBER)
-	}
-
-	lastMark, result := self.isQuotationMark(0)
-	if result {
-		for self.nextRune() {
-			r, result := self.isQuotationMark(lastMark)
-			if result {
-				break
+	for _, parser := range self.tokenParsers.Parsers {
+		if parser != nil {
+			tokenType := parser(self)
+			if tokenType != TOKEN_NULL {
+				return self.token(tokenType), nil
 			}
-			self.appendRune()
 		}
-		return self.token(TOKEN_STRING)
 	}
 
-	self.appendRune()
-	return self.token(TOKEN_UNKNOWN)
+	self.AppendRune()
+	self.NextRune()
+	return self.token(TOKEN_UNKNOWN), nil
+}
+
+func (self *Lexer) PutBack(token Token) {
+	self.putbackTokens.PushBack(&token)
 }
