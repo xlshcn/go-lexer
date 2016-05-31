@@ -4,7 +4,20 @@ import "testing"
 import "strings"
 
 func TestLexer(t *testing.T) {
-	text := "func TestLexer(t *testing.T) = \"Hello, World\""
+	text := `
+	package golexer
+	import "testing"
+	import "strings"
+	
+	var NullArgumentError = errors.New("Null argument.")
+
+	type TokenType int
+
+	const (
+		TOKEN_NULL TokenType = itoa
+		TOKEN_EOF
+	)
+	`
 	reader := strings.NewReader(text)
 	lexer, err := NewLexer(reader, nil)
 	if err != nil {
@@ -18,7 +31,7 @@ func TestLexer(t *testing.T) {
 		if err != nil {
 			t.Logf("Error: %s", err.Error())
 		} else {
-			t.Logf("Token: %s", token.Literal)
+			t.Logf("%d(%d): %s (%v)", token.LineNumber, token.LinePos, token.Literal, token.Type)
 		}
 	}
 }

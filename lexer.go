@@ -5,9 +5,9 @@ import "errors"
 import "unicode"
 import "bytes"
 import "container/list"
-import "fmt"
 
 var NullArgumentError = errors.New("Null argument.")
+var EofError = errors.New("End of file.")
 
 type TokenType int
 
@@ -20,11 +20,6 @@ const (
 	TOKEN_UNKNOWN
 )
 
-const (
-	EMPTY_RUNE            rune = 0
-	MAX_TOKEN_BUFFER_SIZE      = 1024
-)
-
 type Token struct {
 	Type       TokenType
 	Literal    string
@@ -32,32 +27,47 @@ type Token struct {
 	LinePos    int
 }
 
-type ILexerScanner interface {
+type IRuneScanner interface {
 	NextRune() rune
 	Rune() rune
+}
+
+type ITokenBuilder interface {
 	AppendRune() bool
 }
 
-type TokenParser func(scanner ILexerScanner) TokenType
+// The TokenParser reads the runes from the scanner, recognize the rune and build the token via
+// ITokenBuilder.
+// The function returns TOKEN_NULL to indicate that no match found. Otherwise, returns the recognized
+// token type. The value of the token should be built and stored in ITokenBuilder.
+type TokenParser func(scanner IRuneScanner, builder ITokenBuilder) TokenType
 
 type TokenParsers struct {
-	WhitespaceParser TokenParser
-	Parsers          []TokenParser
+	SkipWhitespaces TokenParser
+	Parsers         []TokenParser
 }
 
-func NewTokenParsers() *TokenParsers {
-	return &TokenParsers{
-		WhitespaceParser: DefaultWhitespaceParser,
-		Parsers: []TokenParser{
-			DefaultIdentifierParser,
-			DefaultNumberParser,
-			DefaultQuotedStringParser,
-			DefaultCommentParser,
-		},
+func NewTokenParsers(skipWhitespaces TokenParser, parsers ...TokenParser) *TokenParsers {
+	tp := TokenParsers{
+		skipWhitespaces,
+		make([]TokenParser, len(parsers)),
 	}
+	for index, parser := range parsers {
+		tp.Parsers[index] = parser
+	}
+	return &tp
 }
 
-func DefaultWhitespaceParser(scanner ILexerScanner) TokenType {
+func NewDefaultTokenParsers() *TokenParsers {
+	return NewTokenParsers(
+		DefaultSkipWritespaces,
+		DefaultIdentifierParser,
+		DefaultNumberParser,
+		DefaultQuotedStringParser,
+		DefaultCommentParser)
+}
+
+func DefaultSkipWritespaces(scanner IRuneScanner, builder ITokenBuilder) TokenType {
 	if unicode.IsSpace(scanner.Rune()) {
 		for unicode.IsSpace(scanner.Rune()) {
 			if scanner.NextRune() == 0 {
@@ -68,11 +78,11 @@ func DefaultWhitespaceParser(scanner ILexerScanner) TokenType {
 	return TOKEN_NULL
 }
 
-func DefaultIdentifierParser(scanner ILexerScanner) TokenType {
+func DefaultIdentifierParser(scanner IRuneScanner, builder ITokenBuilder) TokenType {
 	r := scanner.Rune()
 	if unicode.IsLetter(r) || r == '_' {
 		for unicode.IsLetter(r) || r == '_' || unicode.IsDigit(r) {
-			scanner.AppendRune()
+			builder.AppendRune()
 			r = scanner.NextRune()
 		}
 		return TOKEN_IDENTIFIER
@@ -80,11 +90,11 @@ func DefaultIdentifierParser(scanner ILexerScanner) TokenType {
 	return TOKEN_NULL
 }
 
-func DefaultNumberParser(scanner ILexerScanner) TokenType {
+func DefaultNumberParser(scanner IRuneScanner, builder ITokenBuilder) TokenType {
 	r := scanner.Rune()
 	if unicode.IsDigit(r) {
 		for unicode.IsDigit(r) {
-			scanner.AppendRune()
+			builder.AppendRune()
 			r = scanner.NextRune()
 		}
 		return TOKEN_NUMBER
@@ -92,21 +102,22 @@ func DefaultNumberParser(scanner ILexerScanner) TokenType {
 	return TOKEN_NULL
 }
 
-func DefaultQuotedStringParser(scanner ILexerScanner) TokenType {
+func DefaultQuotedStringParser(scanner IRuneScanner, builder ITokenBuilder) TokenType {
 	quotemark := scanner.Rune()
 	if quotemark == '"' || quotemark == '\'' {
 		for scanner.NextRune() != 0 {
 			if scanner.Rune() == quotemark {
+				scanner.NextRune()
 				break
 			}
-			scanner.AppendRune()
+			builder.AppendRune()
 		}
 		return TOKEN_STRING
 	}
 	return TOKEN_NULL
 }
 
-func DefaultCommentParser(scanner ILexerScanner) TokenType {
+func DefaultCommentParser(scanner IRuneScanner, builder ITokenBuilder) TokenType {
 	r := scanner.Rune()
 	if r == '#' {
 		for scanner.NextRune() != 0 {
@@ -123,6 +134,7 @@ type Lexer struct {
 	scanner       io.RuneScanner
 	lineno        int
 	pos           int
+	lastPos       int
 	r             rune
 	eof           bool
 	buf           bytes.Buffer
@@ -135,7 +147,7 @@ func NewLexer(scanner io.RuneScanner, tokenParsers *TokenParsers) (*Lexer, error
 		return nil, NullArgumentError
 	}
 	if tokenParsers == nil {
-		tokenParsers = NewTokenParsers()
+		tokenParsers = NewDefaultTokenParsers()
 	}
 
 	lexer := new(Lexer)
@@ -143,6 +155,7 @@ func NewLexer(scanner io.RuneScanner, tokenParsers *TokenParsers) (*Lexer, error
 	lexer.scanner = scanner
 	lexer.putbackTokens = list.New()
 
+	// read the first rune to kick off the lexer scan process.
 	lexer.NextRune()
 
 	return lexer, nil
@@ -151,7 +164,6 @@ func NewLexer(scanner io.RuneScanner, tokenParsers *TokenParsers) (*Lexer, error
 func (self *Lexer) NextRune() rune {
 	if !self.eof {
 		r, size, err := self.scanner.ReadRune()
-		fmt.Printf("Next Rune: %q (%d)\n", r, size)
 		if err != nil {
 			r = 0
 			self.eof = true
@@ -180,7 +192,7 @@ func (self *Lexer) token(tokenType TokenType) Token {
 		Type:       tokenType,
 		Literal:    self.buf.String(),
 		LineNumber: self.lineno,
-		LinePos:    self.pos,
+		LinePos:    self.lastPos,
 	}
 	return self.lastToken
 }
@@ -190,6 +202,7 @@ func (self *Lexer) IsEnd() bool {
 }
 
 func (self *Lexer) GetToken() (Token, error) {
+	// Handles the putback tokens first.
 	if self.putbackTokens.Len() > 0 {
 		e := self.putbackTokens.Back()
 		ptoken, _ := e.Value.(*Token)
@@ -198,21 +211,26 @@ func (self *Lexer) GetToken() (Token, error) {
 		return self.lastToken, nil
 	}
 
-	self.tokenParsers.WhitespaceParser(self)
-	if self.eof {
-		return self.token(TOKEN_EOF), nil
+	// Skip all whitespaces
+	if self.tokenParsers.SkipWhitespaces(self, self) == TOKEN_EOF || self.IsEnd() {
+		return self.token(TOKEN_EOF), EofError
 	}
 
+	self.lastPos = self.pos - 1
+
+	// Clear the token buffer.
 	self.buf.Reset()
+
 	for _, parser := range self.tokenParsers.Parsers {
 		if parser != nil {
-			tokenType := parser(self)
+			tokenType := parser(self, self)
 			if tokenType != TOKEN_NULL {
 				return self.token(tokenType), nil
 			}
 		}
 	}
 
+	// Any unrecognized runes is treated as an unknown token.
 	self.AppendRune()
 	self.NextRune()
 	return self.token(TOKEN_UNKNOWN), nil
