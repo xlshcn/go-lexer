@@ -25,6 +25,7 @@ type Token struct {
 	Literal    string
 	LineNumber int
 	LinePos    int
+	Value      interface{}
 }
 
 type IRuneScanner interface {
@@ -34,13 +35,15 @@ type IRuneScanner interface {
 
 type ITokenBuilder interface {
 	AppendRune() bool
+	TokenLiteral() string
+	SetValue(value interface{})
 }
 
 // The TokenParser reads the runes from the scanner, recognize the rune and build the token via
 // ITokenBuilder.
 // The function returns TOKEN_NULL to indicate that no match found. Otherwise, returns the recognized
 // token type. The value of the token should be built and stored in ITokenBuilder.
-type TokenParser func(scanner IRuneScanner, builder ITokenBuilder) TokenType
+type TokenParser func(scanner IRuneScanner, builder ITokenBuilder) (TokenType, error)
 
 type TokenParsers struct {
 	SkipWhitespaces TokenParser
@@ -67,7 +70,7 @@ func NewDefaultTokenParsers() *TokenParsers {
 		DefaultCommentParser)
 }
 
-func DefaultSkipWritespaces(scanner IRuneScanner, builder ITokenBuilder) TokenType {
+func DefaultSkipWritespaces(scanner IRuneScanner, builder ITokenBuilder) (TokenType, error) {
 	if unicode.IsSpace(scanner.Rune()) {
 		for unicode.IsSpace(scanner.Rune()) {
 			if scanner.NextRune() == 0 {
@@ -75,34 +78,34 @@ func DefaultSkipWritespaces(scanner IRuneScanner, builder ITokenBuilder) TokenTy
 			}
 		}
 	}
-	return TOKEN_NULL
+	return TOKEN_NULL, nil
 }
 
-func DefaultIdentifierParser(scanner IRuneScanner, builder ITokenBuilder) TokenType {
+func DefaultIdentifierParser(scanner IRuneScanner, builder ITokenBuilder) (TokenType, error) {
 	r := scanner.Rune()
 	if unicode.IsLetter(r) || r == '_' {
 		for unicode.IsLetter(r) || r == '_' || unicode.IsDigit(r) {
 			builder.AppendRune()
 			r = scanner.NextRune()
 		}
-		return TOKEN_IDENTIFIER
+		return TOKEN_IDENTIFIER, nil
 	}
-	return TOKEN_NULL
+	return TOKEN_NULL, nil
 }
 
-func DefaultNumberParser(scanner IRuneScanner, builder ITokenBuilder) TokenType {
+func DefaultNumberParser(scanner IRuneScanner, builder ITokenBuilder) (TokenType, error) {
 	r := scanner.Rune()
 	if unicode.IsDigit(r) {
 		for unicode.IsDigit(r) {
 			builder.AppendRune()
 			r = scanner.NextRune()
 		}
-		return TOKEN_NUMBER
+		return TOKEN_NUMBER, nil
 	}
-	return TOKEN_NULL
+	return TOKEN_NULL, nil
 }
 
-func DefaultQuotedStringParser(scanner IRuneScanner, builder ITokenBuilder) TokenType {
+func DefaultQuotedStringParser(scanner IRuneScanner, builder ITokenBuilder) (TokenType, error) {
 	quotemark := scanner.Rune()
 	if quotemark == '"' || quotemark == '\'' {
 		for scanner.NextRune() != 0 {
@@ -112,12 +115,12 @@ func DefaultQuotedStringParser(scanner IRuneScanner, builder ITokenBuilder) Toke
 			}
 			builder.AppendRune()
 		}
-		return TOKEN_STRING
+		return TOKEN_STRING, nil
 	}
-	return TOKEN_NULL
+	return TOKEN_NULL, nil
 }
 
-func DefaultCommentParser(scanner IRuneScanner, builder ITokenBuilder) TokenType {
+func DefaultCommentParser(scanner IRuneScanner, builder ITokenBuilder) (TokenType, error) {
 	r := scanner.Rune()
 	if r == '#' {
 		for scanner.NextRune() != 0 {
@@ -126,7 +129,7 @@ func DefaultCommentParser(scanner IRuneScanner, builder ITokenBuilder) TokenType
 			}
 		}
 	}
-	return TOKEN_NULL
+	return TOKEN_NULL, nil
 }
 
 type Lexer struct {
@@ -138,6 +141,7 @@ type Lexer struct {
 	r             rune
 	eof           bool
 	buf           bytes.Buffer
+	value         interface{}
 	lastToken     Token
 	putbackTokens *list.List
 }
@@ -187,12 +191,21 @@ func (self *Lexer) AppendRune() bool {
 	return true
 }
 
+func (self *Lexer) TokenLiteral() string {
+	return self.buf.String()
+}
+
+func (self *Lexer) SetValue(value interface{}) {
+	self.value = value
+}
+
 func (self *Lexer) token(tokenType TokenType) Token {
 	self.lastToken = Token{
 		Type:       tokenType,
 		Literal:    self.buf.String(),
 		LineNumber: self.lineno,
 		LinePos:    self.lastPos,
+		Value:      self.value,
 	}
 	return self.lastToken
 }
@@ -212,7 +225,8 @@ func (self *Lexer) GetToken() (Token, error) {
 	}
 
 	// Skip all whitespaces
-	if self.tokenParsers.SkipWhitespaces(self, self) == TOKEN_EOF || self.IsEnd() {
+	tokenType, _ := self.tokenParsers.SkipWhitespaces(self, self)
+	if tokenType == TOKEN_EOF || self.IsEnd() {
 		return self.token(TOKEN_EOF), EofError
 	}
 
@@ -220,10 +234,14 @@ func (self *Lexer) GetToken() (Token, error) {
 
 	// Clear the token buffer.
 	self.buf.Reset()
+	self.value = nil
 
 	for _, parser := range self.tokenParsers.Parsers {
 		if parser != nil {
-			tokenType := parser(self, self)
+			tokenType, err := parser(self, self)
+			if err != nil {
+				return self.token(tokenType), err
+			}
 			if tokenType != TOKEN_NULL {
 				return self.token(tokenType), nil
 			}
